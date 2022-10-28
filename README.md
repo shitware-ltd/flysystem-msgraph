@@ -2,7 +2,7 @@
 A flysystem 3.0 adapter for Sharepoint 365 / OneDrive using Microsoft Graph API with support for uploading large files
 
 # Installation
-```composer require shitwareltd/flysystem-msgraph```
+```composer require shitware-ltd/flysystem-msgraph```
 
 # Usage
 Instantiate the adapter by passing in an instance of `\Microsoft\Graph\Graph` and the DriveId of the drive you want to use. 
