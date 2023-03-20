@@ -219,14 +219,11 @@ class Adapter implements FilesystemAdapter
 
     public function read(string $path): string
     {
-        if (!($object = $this->readStream($path))) {
+        if (!($stream = $this->readStream($path))) {
             throw new UnableToReadFile('Unable to read file at ' . $path);
         }
 
-        $object['contents'] = stream_get_contents($object['stream']);
-        unset($object['stream']);
-
-        return $object['contents'];
+        return stream_get_contents($stream);
     }
 
     public function readStream(string $path)
@@ -246,9 +243,7 @@ class Adapter implements FilesystemAdapter
             $download_url,
         );
 
-        $stream = StreamWrapper::getResource($response->getBody());
-
-        return compact('stream');
+        return StreamWrapper::getResource($response->getBody());
     }
 
     public function delete(string $path): void
