@@ -266,23 +266,31 @@ class Adapter implements FilesystemAdapter
 
     public function createDirectory(string $path, Config $config): void
     {
-        $newDirPathArray = explode('/', $path);
-        $newDirName = array_pop($newDirPathArray);
-        $parentItem = count($newDirPathArray)
-            ? $this->getUrlToPath(implode('/', $newDirPathArray))
-            : $this->getDriveRootUrl();
+        $parts = explode('/', $path);
+        $folderName = end($parts);
+        array_pop($parts);
+        $path = implode('/', $parts);
 
-        $dirItem = $this->graph
-            ->createRequest(
-                'POST',
-                $this->getDriveItemUrl($parentItem) . '/children'
-            )
-            ->attachBody([
-                'name' => $newDirName,
-                'folder' => new \stdClass(),
-            ])
-            ->setReturnType(DriveItem::class)
-            ->execute();
+        $folders = [
+            "id"      => 1,
+            "method"  => "POST",
+            "url"     => $this->getDriveRootUrl().":/$path:/children",
+            "body"    => [
+                "name"                              => $folderName,
+                "folder"                            => new \stdClass(),
+                "@microsoft.graph.conflictBehavior" => "fail"
+            ],
+            "headers" => [
+                "Content-Type" => "application/json"
+            ]
+        ];
+
+        $this->graph
+        ->createRequest("POST", "/\$batch")
+        ->attachBody([
+            'requests' => [$folders]
+        ])
+        ->execute();
     }
 
     public function setVisibility(string $path, string $visibility): void
