@@ -91,6 +91,8 @@ class Adapter implements FilesystemAdapter
 
     public function write(string $path, string $contents, Config $config): void
     {
+        $path = trim($path, '/');
+        $this->ensureValidPath($path);
         //Files larger than 4MiB require an UploadSession
         if (strlen($contents) > 4194304) {
             $stream = fopen('php://temp', 'r+');
@@ -101,8 +103,6 @@ class Adapter implements FilesystemAdapter
             return;
         }
 
-        $path = trim($path, '/');
-        $this->ensureValidPath($path);
 
         $file_name = basename($path);
         $parentItem = $this->getUrlToPath(dirname($path));
@@ -268,14 +268,12 @@ class Adapter implements FilesystemAdapter
     {
         $newDirPathArray = explode('/', $path);
         $newDirName = array_pop($newDirPathArray);
-        $parentItem = count($newDirPathArray)
-            ? $this->getUrlToPath(implode('/', $newDirPathArray))
-            : $this->getDriveRootUrl();
+        $path = implode('/', $newDirPathArray);
 
         $dirItem = $this->graph
             ->createRequest(
                 'POST',
-                $this->getDriveItemUrl($parentItem) . '/children'
+                $this->getUrlToPath($path) . ':/children'
             )
             ->attachBody([
                 'name' => $newDirName,
@@ -469,13 +467,8 @@ class Adapter implements FilesystemAdapter
 
     protected function ensureDirectoryExists(string $path)
     {
-        $directories = explode('/', $path);
-        $current_path = '';
-        foreach ($directories as $directory) {
-            $current_path = trim($current_path .= '/' . $directory, '/');
-            if (!$this->directoryExists($current_path)) {
-                $this->createDirectory($current_path, new Config());
-            }
+        if (!$this->directoryExists($path)) {
+            $this->createDirectory($path, new Config());
         }
     }
 
