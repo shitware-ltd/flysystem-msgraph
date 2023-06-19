@@ -29,6 +29,7 @@ class Adapter implements FilesystemAdapter
         $default_options = [
             'request_timeout' => 90,        //Increase this for larger chunks / higher latency
             'chunk_size' => 320 * 1024 * 10, //Microsoft requires chunks to be multiples of 320KB
+            'directory_conflict_behavior' => 'fail', //rename, replace, fail
         ];
 
         $this->options = array_merge($default_options, $options);
@@ -264,6 +265,15 @@ class Adapter implements FilesystemAdapter
         $this->delete($path);
     }
 
+    public function getChildrenUrl(string $path): string
+    {
+        if ($path === '' || $path === '.' || $path === '/') {
+            return $this->getDriveRootUrl() . '/children';
+        }
+
+        return $this->getDriveRootUrl() . ':/' . $path . ':/children';
+    }
+
     public function createDirectory(string $path, Config $config): void
     {
         $newDirPathArray = explode('/', $path);
@@ -273,11 +283,12 @@ class Adapter implements FilesystemAdapter
         $dirItem = $this->graph
             ->createRequest(
                 'POST',
-                $this->getUrlToPath($path) . ':/children'
+                $this->getChildrenUrl($path)
             )
             ->attachBody([
                 'name' => $newDirName,
                 'folder' => new \stdClass(),
+                '@microsoft.graph.conflictBehavior' => $this->options['directory_conflict_behavior'],
             ])
             ->setReturnType(DriveItem::class)
             ->execute();
