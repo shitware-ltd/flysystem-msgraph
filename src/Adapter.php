@@ -24,16 +24,30 @@ class Adapter implements FilesystemAdapter
 {
     protected $options = [];
 
+    protected const CONFLICT_BEHAVIOR_FAIL = 'fail';
+    protected const CONFLICT_BEHAVIOR_IGNORE = 'ignore';
+    protected const CONFLICT_BEHAVIOR_RENAME = 'rename';
+    protected const CONFLICT_BEHAVIOR_REPLACE = 'replace';
+
     public function __construct(public Graph $graph, protected string $drive_id, array $options = [])
     {
         $default_options = [
             'request_timeout' => 90,        //Increase this for larger chunks / higher latency
             'chunk_size' => 320 * 1024 * 10, //Microsoft requires chunks to be multiples of 320KB
-            'directory_conflict_behavior' => 'fail', //rename, replace, fail
+            'directory_conflict_behavior' => static::CONFLICT_BEHAVIOR_IGNORE, //ignore, rename, replace, fail
         ];
 
         $this->options = array_merge($default_options, $options);
-
+        switch($this->options['directory_conflict_behavior']) {
+            case static::CONFLICT_BEHAVIOR_FAIL:
+            case static::CONFLICT_BEHAVIOR_IGNORE:
+            case static::CONFLICT_BEHAVIOR_RENAME:
+            case static::CONFLICT_BEHAVIOR_REPLACE:
+                break;
+            default:
+                throw new Exception('Invalid directory_conflict_behavior');
+        }
+        
         if ($this->options['chunk_size'] % (320 * 1024)) {
             throw new Exception('Chunk size must be a multiple of 320KB');
         }
@@ -276,6 +290,10 @@ class Adapter implements FilesystemAdapter
 
     public function createDirectory(string $path, Config $config): void
     {
+        if ($this->options['directory_conflict_behavior'] == static::CONFLICT_BEHAVIOR_IGNORE && $this->directoryExists($path)) {
+            return;
+        }
+
         $newDirPathArray = explode('/', $path);
         $newDirName = array_pop($newDirPathArray);
         $path = implode('/', $newDirPathArray);
