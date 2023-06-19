@@ -297,17 +297,19 @@ class Adapter implements FilesystemAdapter
         $newDirPathArray = explode('/', $path);
         $newDirName = array_pop($newDirPathArray);
         $path = implode('/', $newDirPathArray);
-
+        $body = [
+            'name' => $newDirName,
+            'folder' => new \stdClass(),
+        ];
+        if ($this->options['directory_conflict_behavior'] !== static::CONFLICT_BEHAVIOR_IGNORE) {
+            $body['@microsoft.graph.conflictBehavior'] = $this->options['directory_conflict_behavior'];
+        }
         $dirItem = $this->graph
             ->createRequest(
                 'POST',
                 $this->getChildrenUrl($path)
             )
-            ->attachBody([
-                'name' => $newDirName,
-                'folder' => new \stdClass(),
-                '@microsoft.graph.conflictBehavior' => $this->options['directory_conflict_behavior'],
-            ])
+            ->attachBody($body)
             ->setReturnType(DriveItem::class)
             ->execute();
     }
