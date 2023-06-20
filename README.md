@@ -25,7 +25,7 @@ A: I couldn't find one for flysystem 3.0 that implemented `writeStream` properly
 
 Q: How do I find my drive ID?
 
-A: Out of scope for this project.
+A: [Out of scope for this project.](https://learn.microsoft.com/en-us/answers/questions/730575/how-to-find-site-id-and-drive-id-for-graph-api)
 
 Q: What happens if my access token expires?
 
