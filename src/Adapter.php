@@ -4,15 +4,26 @@ namespace ShitwareLtd\FlysystemMsGraph;
 
 use Exception;
 use GuzzleHttp\Client as Guzzle;
+use GuzzleHttp\Exception\GuzzleException;
 use GuzzleHttp\Psr7\StreamWrapper;
 use League\Flysystem\Config;
 use League\Flysystem\DirectoryAttributes;
 use League\Flysystem\FileAttributes;
 use League\Flysystem\FilesystemAdapter;
+use League\Flysystem\FilesystemException;
 use League\Flysystem\StorageAttributes;
+use League\Flysystem\UnableToCheckDirectoryExistence;
+use League\Flysystem\UnableToCheckFileExistence;
+use League\Flysystem\UnableToCopyFile;
+use League\Flysystem\UnableToCreateDirectory;
+use League\Flysystem\UnableToDeleteFile;
+use League\Flysystem\UnableToListContents;
+use League\Flysystem\UnableToMoveFile;
 use League\Flysystem\UnableToReadFile;
 use League\Flysystem\UnableToRetrieveMetadata;
 use League\Flysystem\UnableToSetVisibility;
+use League\Flysystem\UnableToWriteFile;
+use Microsoft\Graph\Exception\GraphException;
 use Microsoft\Graph\Graph;
 use Microsoft\Graph\Http\GraphResponse;
 use Microsoft\Graph\Model\Directory;
@@ -22,13 +33,17 @@ use Microsoft\Graph\Model\UploadSession;
 
 class Adapter implements FilesystemAdapter
 {
-    protected $options = [];
+    /** @var array<string, scalar> */
+    protected array $options = [];
 
     protected const CONFLICT_BEHAVIOR_FAIL = 'fail';
     protected const CONFLICT_BEHAVIOR_IGNORE = 'ignore';
     protected const CONFLICT_BEHAVIOR_RENAME = 'rename';
     protected const CONFLICT_BEHAVIOR_REPLACE = 'replace';
 
+    /**
+     * @throws Exception
+     */
     public function __construct(public Graph $graph, protected string $drive_id, array $options = [])
     {
         $default_options = [
@@ -67,6 +82,10 @@ class Adapter implements FilesystemAdapter
         return $this->getDriveRootUrl() . ':/' . $path;
     }
 
+    /**
+     * @throws GraphException
+     * @throws GuzzleException
+     */
     protected function getDriveItemUrl(string $path): string
     {
         return '/drives/' . $this->drive_id . '/items/' . $this->getDriveItem($path)->getId();
@@ -79,8 +98,14 @@ class Adapter implements FilesystemAdapter
             $this->getFile($path);
 
             return true;
-        } catch (\Exception $e) {
-            return false;
+        } catch (GuzzleException $e) {
+            if (404 === $e->getCode()) {
+                return false;
+            }
+
+            throw UnableToCheckFileExistence::forLocation($path, $e);
+        } catch (GraphException $e) {
+            throw UnableToCheckFileExistence::forLocation($path, $e);
         }
     }
 
@@ -91,12 +116,21 @@ class Adapter implements FilesystemAdapter
             $this->getDirectory($path);
 
             return true;
-        } catch (\Exception $e) {
-            return false;
+        } catch (GuzzleException $e) {
+            if (404 === $e->getCode()) {
+                return false;
+            }
+
+            throw UnableToCheckDirectoryExistence::forLocation($path, $e);
+        } catch (GraphException $e) {
+            throw UnableToCheckDirectoryExistence::forLocation($path, $e);
         }
     }
 
-    protected function ensureValidPath(string $path)
+    /**
+     * @throws FilesystemException
+     */
+    protected function ensureValidPath(string $path): void
     {
         //If we're not writing to root we need to make sure the target directory exists
         if (str_contains($path, '/')) {
@@ -121,16 +155,20 @@ class Adapter implements FilesystemAdapter
 
         $file_name = basename($path);
         $parentItem = $this->getUrlToPath(dirname($path));
-        $dirItem = $this->graph
-            ->createRequest(
-                'PUT',
-                $this->getDriveItemUrl($parentItem) . ":/$file_name:/content"
-            )
-            ->addHeaders([
-                'Content-Type' => 'text/plain',
-            ])
-            ->attachBody($contents)
-            ->execute();
+        try {
+            $this->graph
+                ->createRequest(
+                    'PUT',
+                    $this->getDriveItemUrl($parentItem) . ":/$file_name:/content"
+                )
+                ->addHeaders([
+                    'Content-Type' => 'text/plain',
+                ])
+                ->attachBody($contents)
+                ->execute();
+        } catch (GraphException|GuzzleException $e) {
+            throw UnableToWriteFile::atLocation($path, '', $e);
+        }
     }
 
     private function getUploadSessionUrl(string $path): string
@@ -138,34 +176,51 @@ class Adapter implements FilesystemAdapter
         return "/drives/$this->drive_id/items/root:/$path:/createUploadSession";
     }
 
+    /**
+     * @throws GraphException
+     * @throws GuzzleException
+     */
     public function createUploadSession($path): UploadSession
     {
-        return $this->graph->createRequest('POST', $this->getUploadSessionUrl($path))->setReturnType(UploadSession::class)->execute();
+        return $this->graph->createRequest('POST', $this->getUploadSessionUrl($path))
+            ->setReturnType(UploadSession::class)
+            ->execute();
     }
 
     /**
-     * @param  resource  $contents
+     * @param resource $contents
+     * @throws FilesystemException
      */
     public function writeStream(string $path, $contents, Config $config): void
     {
-        $path = trim($path, '/');
-        $this->ensureValidPath($path);
-        $upload_session = $this->createUploadSession($path);
-        $upload_url = $upload_session->getUploadUrl();
+        try {
+            $path = trim($path, '/');
+            $this->ensureValidPath($path);
+            $upload_session = $this->createUploadSession($path);
+            $upload_url = $upload_session->getUploadUrl();
 
-        $meta = fstat($contents);
-        $chunk_size = $config->withDefaults($this->options)->get('chunk_size');
-        $offset = 0;
+            $meta = fstat($contents);
+            $chunk_size = $config->withDefaults($this->options)->get('chunk_size');
+            $offset = 0;
 
-        //Chunks have to be uploaded without authorization headers, so we need a fresh guzzle client
-        $guzzle = new Guzzle();
-        while ($chunk = fread($contents, $chunk_size)) {
-            $this->writeChunk($guzzle, $upload_url, $meta['size'], $chunk, $offset);
-            $offset += $chunk_size;
+            //Chunks have to be uploaded without authorization headers, so we need a fresh guzzle client
+            $guzzle = new Guzzle();
+            while ($chunk = fread($contents, $chunk_size)) {
+                $this->writeChunk($guzzle, $upload_url, $meta['size'], $chunk, $offset);
+                $offset += $chunk_size;
+            }
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToWriteFile::atLocation($path, '', $e);
+        } catch (UnableToWriteFile $e) {
+            throw UnableToWriteFile::atLocation($path, $e->getMessage(), $e);
         }
     }
 
-    private function writeChunk(Guzzle $guzzle, string $upload_url, int $file_size, string $chunk, int $first_byte, int $retries = 0)
+    /**
+     * @throws GuzzleException
+     * @throws GraphException
+     */
+    private function writeChunk(Guzzle $guzzle, string $upload_url, int $file_size, string $chunk, int $first_byte, int $retries = 0): void
     {
         $last_byte_pos = $first_byte + strlen($chunk) - 1;
         $headers = [
@@ -184,7 +239,7 @@ class Adapter implements FilesystemAdapter
         );
 
         if ($response->getStatusCode() === 404) {
-            throw new \Exception('Upload URL has expired, please create new upload session');
+            throw new UnableToWriteFile('Upload URL has expired, please create new upload session');
         }
 
         if ($response->getStatusCode() === 429) {
@@ -196,7 +251,7 @@ class Adapter implements FilesystemAdapter
             //Server errors happen sometimes. Wait a bit and retry
             if ($retries > 9) {
                 //After 10 tries we're probably not gonna get anywhere
-                throw new \Exception('Upload failed after 10 attempts.');
+                throw new UnableToWriteFile('Upload failed after 10 attempts.');
             }
             sleep(pow(2, $retries));
             $this->writeChunk($guzzle, $upload_url, $file_size, $chunk, $first_byte, $retries + 1);
@@ -204,7 +259,7 @@ class Adapter implements FilesystemAdapter
 
         if (($file_size - 1) == $last_byte_pos) {
             if ($response->getStatusCode() === 409) {
-                throw new \Exception('File name conflict. A file with the same name already exists at target destination.');
+                throw new UnableToWriteFile('File name conflict. A file with the same name already exists at target destination.');
             }
 
             if (in_array($response->getStatusCode(), [200, 201])) {
@@ -215,21 +270,18 @@ class Adapter implements FilesystemAdapter
                     $response->getHeaders()
                 );
 
-                $item = $response->getResponseAsObject(DriveItem::class);
+                $response->getResponseAsObject(DriveItem::class);
 
-                return $item;
+                return;
             }
 
-            throw new \Exception(
-                'Unknown error occured while uploading last part of file. HTTP response code is ' . $response->getStatusCode()
-            );
+            throw new UnableToWriteFile('Unknown error occured while uploading last part of file. HTTP response code is ' . $response->getStatusCode());
         }
 
         if ($response->getStatusCode() !== 202) {
-            throw new \Exception('Unknown error occured while trying to upload file chunk. HTTP status code is ' . $response->getStatusCode());
+            throw new UnableToWriteFile('Unknown error occured while trying to upload file chunk. HTTP status code is ' . $response->getStatusCode());
         }
 
-        return false;
     }
 
     public function read(string $path): string
@@ -243,35 +295,43 @@ class Adapter implements FilesystemAdapter
 
     public function readStream(string $path)
     {
-        $path = $this->getUrlToPath($path);
+        try {
+            $path = $this->getUrlToPath($path);
 
-        $driveitem = $this->getDriveItem($path);
-        //ensure we're dealing with a file
-        if ($driveitem->getFile() == null) {
-            throw new UnableToReadFile("Drive item at $path is not a file");
+            $driveitem = $this->getDriveItem($path);
+            //ensure we're dealing with a file
+            if ($driveitem->getFile() == null) {
+                throw new UnableToReadFile("Drive item at $path is not a file");
+            }
+            $download_url = $driveitem->getProperties()['@microsoft.graph.downloadUrl'];
+
+            $guzzle = new Guzzle();
+            $response = $guzzle->request(
+                'GET',
+                $download_url,
+            );
+
+            return StreamWrapper::getResource($response->getBody());
+        } catch (GuzzleException|GraphException $e) {
+            throw  UnableToReadFile::fromLocation($path, '', $e);
         }
-        $download_url = $driveitem->getProperties()['@microsoft.graph.downloadUrl'];
-
-        $guzzle = new Guzzle();
-        $response = $guzzle->request(
-            'GET',
-            $download_url,
-        );
-
-        return StreamWrapper::getResource($response->getBody());
     }
 
     public function delete(string $path): void
     {
-        $path = $this->getUrlToPath($path);
+        try {
+            $path = $this->getUrlToPath($path);
 
-        $this->graph
-            ->createRequest(
-                'DELETE',
-                $this->getDriveItemUrl($path)
-            )
-            ->execute()
-            ->getBody();
+            $this->graph
+                ->createRequest(
+                    'DELETE',
+                    $this->getDriveItemUrl($path)
+                )
+                ->execute()
+                ->getBody();
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToDeleteFile::atLocation($path, '', $e);
+        }
     }
 
     public function deleteDirectory(string $path): void
@@ -304,14 +364,18 @@ class Adapter implements FilesystemAdapter
         if ($this->options['directory_conflict_behavior'] !== static::CONFLICT_BEHAVIOR_IGNORE) {
             $body['@microsoft.graph.conflictBehavior'] = $this->options['directory_conflict_behavior'];
         }
-        $dirItem = $this->graph
-            ->createRequest(
-                'POST',
-                $this->getChildrenUrl($path)
-            )
-            ->attachBody($body)
-            ->setReturnType(DriveItem::class)
-            ->execute();
+        try {
+            $this->graph
+                ->createRequest(
+                    'POST',
+                    $this->getChildrenUrl($path)
+                )
+                ->attachBody($body)
+                ->setReturnType(DriveItem::class)
+                ->execute();
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToCreateDirectory::atLocation($path, '', $e);
+        }
     }
 
     public function setVisibility(string $path, string $visibility): void
@@ -326,72 +390,86 @@ class Adapter implements FilesystemAdapter
 
     public function mimeType(string $path): FileAttributes
     {
-        $item = $this->getDriveItem(
-            $path = $this->getUrlToPath($path)
-        );
+        try {
+            $item = $this->getDriveItem(
+                $path = $this->getUrlToPath($path)
+            );
 
-        return FileAttributes::fromArray([
-            StorageAttributes::ATTRIBUTE_PATH => $path,
-            StorageAttributes::ATTRIBUTE_MIME_TYPE => $item->getFile()
-                ? $item->getFile()->getMimeType()
-                : null,
-        ]);
+            return FileAttributes::fromArray([
+                StorageAttributes::ATTRIBUTE_PATH => $path,
+                StorageAttributes::ATTRIBUTE_MIME_TYPE => $item->getFile()
+                    ? $item->getFile()->getMimeType()
+                    : null,
+            ]);
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToRetrieveMetadata::mimeType($path, '', $e);
+        }
     }
 
     public function lastModified(string $path): FileAttributes
     {
-        return FileAttributes::fromArray([
-            StorageAttributes::ATTRIBUTE_PATH => $path,
-            StorageAttributes::ATTRIBUTE_LAST_MODIFIED => $this->getDriveItem(
-                $path = $this->getUrlToPath($path)
-            )
-                ->getLastModifiedDateTime()
-                ->getTimestamp(),
-        ]);
+        try {
+            return FileAttributes::fromArray([
+                StorageAttributes::ATTRIBUTE_PATH => $path,
+                StorageAttributes::ATTRIBUTE_LAST_MODIFIED => $this->getDriveItem(
+                    $path = $this->getUrlToPath($path)
+                )
+                    ->getLastModifiedDateTime()
+                    ->getTimestamp(),
+            ]);
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToRetrieveMetadata::lastModified($path, '', $e);
+        }
     }
 
     public function file_size(string $path): FileAttributes
     {
-        return FileAttributes::fromArray([
-            StorageAttributes::ATTRIBUTE_PATH => $path,
-            StorageAttributes::ATTRIBUTE_FILE_SIZE => $this->getDriveItem(
-                $path = $this->getUrlToPath($path)
-            )->getSize(),
-        ]);
+        try {
+            return FileAttributes::fromArray([
+                StorageAttributes::ATTRIBUTE_PATH => $path,
+                StorageAttributes::ATTRIBUTE_FILE_SIZE => $this->getDriveItem(
+                    $path = $this->getUrlToPath($path)
+                )->getSize(),
+            ]);
+        } catch (GraphException|GuzzleException $e) {
+            throw UnableToRetrieveMetadata::fileSize($path, '', $e);
+        }
     }
 
     /**
-     * @return array<string, mixed>
-     *
-     * @throws \Exception
+     * @return array<string, mixed>*
      */
     public function listContents(string $directory, bool $deep): iterable
     {
-        $path = $directory ? $this->getUrlToPath($directory) . ':/children' : '/drives/' . $this->drive_id . '/root/children';
+        try {
+            $path = $directory ? $this->getUrlToPath($directory) . ':/children' : '/drives/' . $this->drive_id . '/root/children';
 
-        /** @var DriveItem[] $items */
-        $items = [];
-        $request = $this->graph
-            ->createCollectionRequest('GET', $path)
-            ->setReturnType(DriveItem::class);
-        while (!$request->isEnd()) {
-            $items = array_merge($items, $request->getPage());
-        }
-        if ($deep) {
-            $folders = array_filter($items, fn ($item) => $item->getFolder() !== null);
-            while (count($folders)) {
-                $folder = array_pop($folders);
-                $folder_path = $folder->getParentReference()->getPath() . DIRECTORY_SEPARATOR . $folder->getName();
-                $children = $this->getChildren($folder_path);
-                $items = array_merge($items, $children);
-                $folders = array_merge($folders, array_filter($children, fn ($child) => $child->getFolder() !== null));
+            /** @var DriveItem[] $items */
+            $items = [];
+            $request = $this->graph
+                ->createCollectionRequest('GET', $path)
+                ->setReturnType(DriveItem::class);
+            while (!$request->isEnd()) {
+                $items = array_merge($items, $request->getPage());
             }
-        }
+            if ($deep) {
+                $folders = array_filter($items, fn ($item) => $item->getFolder() !== null);
+                while (count($folders)) {
+                    $folder = array_pop($folders);
+                    $folder_path = $folder->getParentReference()->getPath() . DIRECTORY_SEPARATOR . $folder->getName();
+                    $children = $this->getChildren($folder_path);
+                    $items = array_merge($items, $children);
+                    $folders = array_merge($folders, array_filter($children, fn ($child) => $child->getFolder() !== null));
+                }
+            }
 
-        return $this->convertDriveItemsToStorageAttributes($items);
+            return $this->convertDriveItemsToStorageAttributes($items);
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToListContents::atLocation($directory, '', $e);
+        }
     }
 
-    private function convertDriveItemsToStorageAttributes(array $drive_items)
+    private function convertDriveItemsToStorageAttributes(array $drive_items): array
     {
         return array_map(function (DriveItem $item) {
             $class = $item->getFile() ? FileAttributes::class : DirectoryAttributes::class;
@@ -410,7 +488,11 @@ class Adapter implements FilesystemAdapter
         }, $drive_items);
     }
 
-    private function getChildren($directory)
+    /**
+     * @throws GraphException
+     * @throws GuzzleException
+     */
+    private function getChildren($directory): array
     {
         $path = $directory . ':/children';
         $request = $this->graph
@@ -437,20 +519,24 @@ class Adapter implements FilesystemAdapter
             ? $this->getUrlToPath(implode('/', $newFilePathArray))
             : $this->getDriveRootUrl();
 
-        $this->graph
-            ->createRequest(
-                'PATCH',
-                $this->getDriveItemUrl($source)
-            )
-            ->attachBody([
-                'parentReference' => [
-                    'driveId' => $this->drive_id,
-                    'id' => $this->getFile($newPath)->getId(),
-                ],
-                'name' => $newFileName,
-            ])
-            ->execute()
-            ->getBody();
+        try {
+            $this->graph
+                ->createRequest(
+                    'PATCH',
+                    $this->getDriveItemUrl($source)
+                )
+                ->attachBody([
+                    'parentReference' => [
+                        'driveId' => $this->drive_id,
+                        'id' => $this->getFile($newPath)->getId(),
+                    ],
+                    'name' => $newFileName,
+                ])
+                ->execute()
+                ->getBody();
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
+        }
     }
 
     public function copy(string $source, string $destination, Config $config): void
@@ -466,22 +552,30 @@ class Adapter implements FilesystemAdapter
             ? $this->getUrlToPath(implode('/', $newFilePathArray))
             : $this->getDriveRootUrl();
 
-        $this->graph
-            ->createRequest(
-                'POST',
-                $this->getDriveItemUrl($source) . '/copy'
-            )
-            ->attachBody([
-                'parentReference' => [
-                    'driveId' => $this->drive_id,
-                    'id' => $this->getFile($newPath)->getId(),
-                ],
-                'name' => $newFileName,
-            ])
-            ->execute()
-            ->getBody();
+        try {
+            $this->graph
+                ->createRequest(
+                    'POST',
+                    $this->getDriveItemUrl($source) . '/copy'
+                )
+                ->attachBody([
+                    'parentReference' => [
+                        'driveId' => $this->drive_id,
+                        'id' => $this->getFile($newPath)->getId(),
+                    ],
+                    'name' => $newFileName,
+                ])
+                ->execute()
+                ->getBody();
+        } catch (GuzzleException|GraphException $e) {
+            throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
+        }
     }
 
+    /**
+     * @throws GraphException
+     * @throws GuzzleException
+     */
     private function getFileAttributes(string $path): FileAttributes
     {
         $file = $this->getDriveItem($path);
@@ -496,7 +590,10 @@ class Adapter implements FilesystemAdapter
         );
     }
 
-    protected function ensureDirectoryExists(string $path)
+    /**
+     * @throws FilesystemException
+     */
+    protected function ensureDirectoryExists(string $path): void
     {
         if (!$this->directoryExists($path)) {
             $this->createDirectory($path, new Config());
@@ -505,11 +602,19 @@ class Adapter implements FilesystemAdapter
 
     public function fileSize(string $path): FileAttributes
     {
-        $path = $this->getUrlToPath($path);
+        try {
+            $path = $this->getUrlToPath($path);
 
-        return $this->getFileAttributes($path);
+            return $this->getFileAttributes($path);
+        } catch (GraphException|GuzzleException $e) {
+            throw UnableToRetrieveMetadata::fileSize($path, '', $e);
+        }
     }
 
+    /**
+     * @throws GraphException
+     * @throws GuzzleException
+     */
     public function getFile(string $path): File
     {
         return $this->graph
@@ -518,6 +623,10 @@ class Adapter implements FilesystemAdapter
             ->execute();
     }
 
+    /**
+     * @throws GuzzleException
+     * @throws GraphException
+     */
     public function getDirectory(string $path): Directory
     {
         return $this->graph
@@ -526,6 +635,10 @@ class Adapter implements FilesystemAdapter
             ->execute();
     }
 
+    /**
+     * @throws GuzzleException
+     * @throws GraphException
+     */
     public function getDriveItem(string $path): DriveItem
     {
         return $this->graph
@@ -534,7 +647,7 @@ class Adapter implements FilesystemAdapter
             ->execute();
     }
 
-    public function setDriveId(string $driveId)
+    public function setDriveId(string $driveId): void
     {
         $this->drive_id = $driveId;
     }
